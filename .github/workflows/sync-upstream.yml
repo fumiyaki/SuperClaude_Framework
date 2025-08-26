@@ -1,0 +1,260 @@
+name: 🔄 Upstream同期＆翻訳管理
+
+on:
+  # 手動実行
+  workflow_dispatch:
+    inputs:
+      create_pr:
+        description: 'PRを自動作成する'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - true
+          - false
+  
+  # 定期実行（毎週月曜日の朝9時JST）
+  schedule:
+    - cron: '0 0 * * MON'  # UTC 0:00 = JST 9:00
+
+jobs:
+  sync-and-detect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      
+    steps:
+      - name: 📥 リポジトリをチェックアウト
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: 🔗 Upstreamリポジトリを設定
+        run: |
+          # 元のリポジトリをupstreamとして追加
+          git remote add upstream https://github.com/anthropics/claude-code.git || true
+          git fetch upstream
+          echo "✅ Upstream設定完了"
+      
+      - name: 📊 現在の状態を確認
+        run: |
+          echo "## 現在のブランチ情報"
+          git branch -a
+          echo ""
+          echo "## リモート情報"
+          git remote -v
+          
+      - name: 🔄 Upstreamの変更を取得
+        id: sync
+        run: |
+          # 新しいブランチを作成
+          BRANCH_NAME="sync-upstream-$(date +%Y%m%d-%H%M%S)"
+          git checkout -b $BRANCH_NAME
+          
+          # upstreamの変更をマージ（コンフリクトがある場合は後で処理）
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "GitHub Actions Bot"
+          
+          # マージを試みる
+          if git merge upstream/master --no-commit --no-ff; then
+            echo "merge_status=success" >> $GITHUB_OUTPUT
+          else
+            echo "merge_status=conflict" >> $GITHUB_OUTPUT
+          fi
+          
+          echo "branch_name=$BRANCH_NAME" >> $GITHUB_OUTPUT
+          
+      - name: 🔍 変更されたMDファイルを検出
+        id: detect-changes
+        run: |
+          # 変更されたMDファイルをリストアップ
+          echo "## 📝 変更されたMarkdownファイル" > diff_report.md
+          echo "" >> diff_report.md
+          
+          # 日本語版と英語版を分けて検出
+          echo "### 英語版（翻訳が必要）" >> diff_report.md
+          git diff --name-only --diff-filter=M HEAD...upstream/master | grep "\.md$" | grep -v "\.ja\.md$" > english_changed.txt || true
+          
+          if [ -s english_changed.txt ]; then
+            cat english_changed.txt | while read file; do
+              echo "- [ ] \`$file\`" >> diff_report.md
+              # 対応する日本語ファイルが存在するかチェック
+              ja_file="${file%.md}.ja.md"
+              if [ -f "$ja_file" ]; then
+                echo "  - 対応する日本語ファイル: \`$ja_file\` ✅" >> diff_report.md
+              else
+                echo "  - ⚠️ 対応する日本語ファイルなし（新規作成が必要）" >> diff_report.md
+              fi
+            done
+          else
+            echo "*変更なし*" >> diff_report.md
+          fi
+          
+          echo "" >> diff_report.md
+          echo "### 既存の日本語版（確認推奨）" >> diff_report.md
+          git diff --name-only --diff-filter=M HEAD...upstream/master | grep "\.ja\.md$" > japanese_changed.txt || true
+          
+          if [ -s japanese_changed.txt ]; then
+            cat japanese_changed.txt | while read file; do
+              echo "- \`$file\`" >> diff_report.md
+            done
+          else
+            echo "*変更なし*" >> diff_report.md
+          fi
+          
+          # 統計情報
+          echo "" >> diff_report.md
+          echo "## 📊 統計情報" >> diff_report.md
+          english_count=$(wc -l < english_changed.txt 2>/dev/null || echo 0)
+          japanese_count=$(wc -l < japanese_changed.txt 2>/dev/null || echo 0)
+          echo "- 翻訳が必要な英語ファイル: $english_count 件" >> diff_report.md
+          echo "- 更新された日本語ファイル: $japanese_count 件" >> diff_report.md
+          
+          # 差分の詳細を追加
+          echo "" >> diff_report.md
+          echo "## 📋 差分詳細" >> diff_report.md
+          echo "" >> diff_report.md
+          
+          if [ -s english_changed.txt ]; then
+            echo "<details>" >> diff_report.md
+            echo "<summary>変更内容の詳細（クリックで展開）</summary>" >> diff_report.md
+            echo "" >> diff_report.md
+            
+            cat english_changed.txt | while read file; do
+              echo "### \`$file\`" >> diff_report.md
+              echo '```diff' >> diff_report.md
+              git diff HEAD...upstream/master -- "$file" | head -100 >> diff_report.md
+              echo '```' >> diff_report.md
+              echo "" >> diff_report.md
+            done
+            
+            echo "</details>" >> diff_report.md
+          fi
+          
+          # 出力を設定
+          echo "has_changes=$([[ $english_count -gt 0 || $japanese_count -gt 0 ]] && echo true || echo false)" >> $GITHUB_OUTPUT
+          echo "english_count=$english_count" >> $GITHUB_OUTPUT
+          echo "japanese_count=$japanese_count" >> $GITHUB_OUTPUT
+          
+      - name: 📝 翻訳ヘルパースクリプトを生成
+        if: steps.detect-changes.outputs.has_changes == 'true'
+        run: |
+          cat > translate_helper.sh << 'EOF'
+          #!/bin/bash
+          
+          echo "🌸 翻訳ヘルパースクリプト"
+          echo "========================"
+          echo ""
+          
+          if [ ! -f english_changed.txt ]; then
+            echo "変更されたファイルが見つかりません。"
+            exit 1
+          fi
+          
+          echo "翻訳が必要なファイル："
+          cat english_changed.txt
+          echo ""
+          
+          for file in $(cat english_changed.txt); do
+            ja_file="${file%.md}.ja.md"
+            echo "-----------------------------------"
+            echo "📄 処理中: $file"
+            echo "📝 日本語版: $ja_file"
+            echo ""
+            
+            if [ -f "$ja_file" ]; then
+              echo "✅ 日本語ファイルが存在します"
+              echo "以下のコマンドで差分を確認できます："
+              echo "  git diff HEAD...upstream/master -- $file"
+            else
+              echo "⚠️  日本語ファイルが存在しません"
+              echo "新規作成が必要です："
+              echo "  cp $file $ja_file"
+            fi
+            echo ""
+          done
+          EOF
+          
+          chmod +x translate_helper.sh
+          
+      - name: 💾 変更をコミット
+        if: steps.detect-changes.outputs.has_changes == 'true'
+        run: |
+          # レポートと補助ファイルを追加
+          git add diff_report.md translate_helper.sh english_changed.txt japanese_changed.txt 2>/dev/null || true
+          
+          # upstream の変更をコミット
+          if [ -n "$(git status --porcelain)" ]; then
+            git commit -m "🔄 Upstream同期: $(date +%Y-%m-%d)
+            
+            翻訳が必要な英語ファイル: ${{ steps.detect-changes.outputs.english_count }} 件
+            更新された日本語ファイル: ${{ steps.detect-changes.outputs.japanese_count }} 件
+            
+            詳細は diff_report.md を確認してください。"
+            
+            git push origin ${{ steps.sync.outputs.branch_name }}
+          fi
+          
+      - name: 🎯 プルリクエストを作成
+        if: steps.detect-changes.outputs.has_changes == 'true' && (github.event_name == 'schedule' || github.event.inputs.create_pr == 'true')
+        uses: peter-evans/create-pull-request@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: ${{ steps.sync.outputs.branch_name }}
+          title: "🔄 [自動] Upstream同期 - 翻訳必要 (${{ steps.detect-changes.outputs.english_count }}件)"
+          body: |
+            ## 🔄 Upstreamからの同期
+            
+            このPRは[元のリポジトリ](https://github.com/anthropics/claude-code)の最新変更を自動的に取り込みました。
+            
+            ### 📊 概要
+            - 🔤 **翻訳が必要な英語ファイル**: ${{ steps.detect-changes.outputs.english_count }} 件
+            - 🇯🇵 **更新された日本語ファイル**: ${{ steps.detect-changes.outputs.japanese_count }} 件
+            - 📅 **同期日時**: $(date +"%Y-%m-%d %H:%M:%S JST")
+            
+            ### 📝 作業手順
+            
+            1. **差分確認**: `diff_report.md` を確認
+            2. **翻訳作業**: 
+               ```bash
+               # ヘルパースクリプトを実行
+               ./translate_helper.sh
+               ```
+            3. **翻訳実施**: 各ファイルの差分部分を日本語に翻訳
+            4. **コミット**: 翻訳完了後、このPRにコミット
+            5. **レビュー**: 翻訳内容を確認してマージ
+            
+            ### ✅ チェックリスト
+            
+            - [ ] `diff_report.md` の内容を確認
+            - [ ] 全ての英語ファイルの変更を翻訳
+            - [ ] 日本語の表現が自然か確認
+            - [ ] リンクや技術用語の整合性確認
+            - [ ] 最終レビュー完了
+            
+            ---
+            *🤖 This PR was automatically created by GitHub Actions*
+          labels: |
+            translation
+            upstream-sync
+            automated
+          draft: true
+          
+      - name: 📊 サマリーを出力
+        if: always()
+        run: |
+          echo "## 🎉 同期完了！" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.detect-changes.outputs.has_changes }}" == "true" ]; then
+            echo "### 📈 変更検出" >> $GITHUB_STEP_SUMMARY
+            echo "- 翻訳が必要: ${{ steps.detect-changes.outputs.english_count }} ファイル" >> $GITHUB_STEP_SUMMARY
+            echo "- 日本語版更新: ${{ steps.detect-changes.outputs.japanese_count }} ファイル" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**ブランチ**: \`${{ steps.sync.outputs.branch_name }}\`" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ✨ 変更なし" >> $GITHUB_STEP_SUMMARY
+            echo "Upstreamに新しい変更はありませんでした。" >> $GITHUB_STEP_SUMMARY
+          fi
